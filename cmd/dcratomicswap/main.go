@@ -21,34 +21,38 @@ import (
 	"strings"
 	"time"
 
-	"github.com/decred/dcrd/chaincfg"
+	pb "decred.org/dcrwallet/rpc/walletrpc"
+	"decred.org/dcrwallet/wallet/txrules"
 	"github.com/decred/dcrd/chaincfg/chainhash"
+	"github.com/decred/dcrd/chaincfg/v3"
 	"github.com/decred/dcrd/dcrec"
-	"github.com/decred/dcrd/dcrutil"
-	"github.com/decred/dcrd/txscript"
+	"github.com/decred/dcrd/dcrutil/v3"
+	"github.com/decred/dcrd/txscript/v3"
 	"github.com/decred/dcrd/wire"
-	pb "github.com/decred/dcrwallet/rpc/walletrpc"
-	"github.com/decred/dcrwallet/wallet/txrules"
 	"golang.org/x/crypto/ripemd160"
 	"golang.org/x/crypto/ssh/terminal"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 )
 
-const verify = true
+const (
+	verify = true
 
-const verifyFlags = txscript.ScriptDiscourageUpgradableNops |
-	txscript.ScriptVerifyCleanStack |
-	txscript.ScriptVerifyCheckLockTimeVerify |
-	txscript.ScriptVerifyCheckSequenceVerify |
-	txscript.ScriptVerifySHA256
+	verifyFlags = txscript.ScriptDiscourageUpgradableNops |
+		txscript.ScriptVerifyCleanStack |
+		txscript.ScriptVerifyCheckLockTimeVerify |
+		txscript.ScriptVerifyCheckSequenceVerify |
+		txscript.ScriptVerifySHA256
 
-const secretSize = 32
+	secretSize = 32
 
-const feePerKb = 1e5
+	feePerKb = 1e5
+
+	scriptVersion = 0
+)
 
 var (
-	chainParams = &chaincfg.MainNetParams
+	chainParams = chaincfg.MainNetParams()
 )
 
 var (
@@ -197,19 +201,15 @@ func run() (err error, showUsage bool) {
 	}
 
 	if *testnetFlag {
-		chainParams = &chaincfg.TestNet3Params
+		chainParams = chaincfg.TestNet3Params()
 	}
 
 	var cmd command
 	switch args[0] {
 	case "initiate":
-		cp2Addr, err := dcrutil.DecodeAddress(args[1])
+		cp2Addr, err := dcrutil.DecodeAddress(args[1], chainParams)
 		if err != nil {
 			return fmt.Errorf("failed to decode participant address: %v", err), true
-		}
-		if !cp2Addr.IsForNet(chainParams) {
-			return fmt.Errorf("participant address is not "+
-				"intended for use on %v", chainParams.Name), true
 		}
 		_, ok := cp2Addr.(*dcrutil.AddressPubKeyHash)
 		if !ok {
@@ -228,13 +228,9 @@ func run() (err error, showUsage bool) {
 		cmd = &initiateCmd{cp2Addr: cp2Addr, amount: amount}
 
 	case "participate":
-		cp1Addr, err := dcrutil.DecodeAddress(args[1])
+		cp1Addr, err := dcrutil.DecodeAddress(args[1], chainParams)
 		if err != nil {
 			return fmt.Errorf("failed to decode initiator address: %v", err), true
-		}
-		if !cp1Addr.IsForNet(chainParams) {
-			return fmt.Errorf("initiator address is not "+
-				"intended for use on %v", chainParams.Name), true
 		}
 		_, ok := cp1Addr.(*dcrutil.AddressPubKeyHash)
 		if !ok {
@@ -381,9 +377,9 @@ func normalizeAddress(addr string, defaultPort string) (hostport string, err err
 
 func walletPort(params *chaincfg.Params) string {
 	switch params {
-	case &chaincfg.MainNetParams:
+	case chaincfg.MainNetParams():
 		return "9111"
-	case &chaincfg.TestNet3Params:
+	case chaincfg.TestNet3Params():
 		return "19111"
 	default:
 		return ""
@@ -462,7 +458,7 @@ func buildContract(ctx context.Context, c pb.WalletServiceClient, args *contract
 	if err != nil {
 		return nil, err
 	}
-	refundAddr, err := dcrutil.DecodeAddress(nar.Address)
+	refundAddr, err := dcrutil.DecodeAddress(nar.Address, chainParams)
 	if err != nil {
 		return nil, err
 	}
@@ -563,7 +559,7 @@ func buildRefund(ctx context.Context, c pb.WalletServiceClient, contract []byte,
 	if err != nil {
 		return nil, 0, err
 	}
-	refundAddress, err := dcrutil.DecodeAddress(nar.Address)
+	refundAddress, err := dcrutil.DecodeAddress(nar.Address, chainParams)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -604,7 +600,7 @@ func buildRefund(ctx context.Context, c pb.WalletServiceClient, contract []byte,
 
 	refundSig, err := c.CreateSignature(ctx, &pb.CreateSignatureRequest{
 		Passphrase:            passphrase,
-		Address:               refundAddr.EncodeAddress(),
+		Address:               refundAddr.Address(),
 		SerializedTransaction: buf.Bytes(),
 		InputIndex:            0,
 		HashType:              pb.CreateSignatureRequest_SIGHASH_ALL,
@@ -620,10 +616,14 @@ func buildRefund(ctx context.Context, c pb.WalletServiceClient, contract []byte,
 	}
 	refundTx.TxIn[0].SignatureScript = refundSigScript
 
+	sigCache, err := txscript.NewSigCache(10)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	if verify {
 		e, err := txscript.NewEngine(contractTx.TxOut[contractOutPoint.Index].PkScript,
-			refundTx, 0, verifyFlags, txscript.DefaultScriptVersion,
-			txscript.NewSigCache(10))
+			refundTx, 0, verifyFlags, scriptVersion, sigCache)
 		if err != nil {
 			panic(err)
 		}
@@ -742,7 +742,7 @@ func (cmd *participateCmd) runCommand(ctx context.Context, c pb.WalletServiceCli
 
 func (cmd *redeemCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) error {
 	pushes, err := txscript.ExtractAtomicSwapDataPushes(
-		txscript.DefaultScriptVersion, cmd.contract)
+		scriptVersion, cmd.contract)
 	if err != nil {
 		return err
 	}
@@ -757,7 +757,7 @@ func (cmd *redeemCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) 
 	contractHash := dcrutil.Hash160(cmd.contract)
 	contractOut := -1
 	for i, out := range cmd.contractTx.TxOut {
-		sc, addrs, _, _ := txscript.ExtractPkScriptAddrs(out.Version, out.PkScript, chainParams)
+		sc, addrs, _, _ := txscript.ExtractPkScriptAddrs(out.Version, out.PkScript, chainParams, true)
 		if sc == txscript.ScriptHashTy && bytes.Equal(addrs[0].Hash160()[:], contractHash) {
 			contractOut = i
 			break
@@ -775,7 +775,7 @@ func (cmd *redeemCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) 
 	if err != nil {
 		return err
 	}
-	addr, err := dcrutil.DecodeAddress(nar.Address)
+	addr, err := dcrutil.DecodeAddress(nar.Address, chainParams)
 	if err != nil {
 		return err
 	}
@@ -813,7 +813,7 @@ func (cmd *redeemCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) 
 
 	redeemSig, err := c.CreateSignature(ctx, &pb.CreateSignatureRequest{
 		Passphrase:            passphrase,
-		Address:               recipientAddr.EncodeAddress(),
+		Address:               recipientAddr.Address(),
 		SerializedTransaction: buf.Bytes(),
 		InputIndex:            0,
 		HashType:              pb.CreateSignatureRequest_SIGHASH_ALL,
@@ -840,10 +840,14 @@ func (cmd *redeemCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) 
 	fmt.Printf("Redeem transaction (%v):\n", &redeemTxHash)
 	fmt.Printf("%x\n\n", buf.Bytes())
 
+        sigCache, err := txscript.NewSigCache(10)
+        if err != nil {
+                return err
+        }
+
 	if verify {
 		e, err := txscript.NewEngine(cmd.contractTx.TxOut[contractOutPoint.Index].PkScript,
-			redeemTx, 0, verifyFlags, txscript.DefaultScriptVersion,
-			txscript.NewSigCache(10))
+			redeemTx, 0, verifyFlags, scriptVersion, sigCache)
 		if err != nil {
 			panic(err)
 		}
@@ -858,7 +862,7 @@ func (cmd *redeemCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) 
 
 func (cmd *refundCmd) runCommand(ctx context.Context, c pb.WalletServiceClient) error {
 	pushes, err := txscript.ExtractAtomicSwapDataPushes(
-		txscript.DefaultScriptVersion, cmd.contract)
+		scriptVersion, cmd.contract)
 	if err != nil {
 		return err
 	}
@@ -923,7 +927,7 @@ func (cmd *auditContractCmd) runOfflineCommand() error {
 	contractHash160 := dcrutil.Hash160(cmd.contract)
 	contractOut := -1
 	for i, out := range cmd.contractTx.TxOut {
-		sc, addrs, _, err := txscript.ExtractPkScriptAddrs(out.Version, out.PkScript, chainParams)
+		sc, addrs, _, err := txscript.ExtractPkScriptAddrs(out.Version, out.PkScript, chainParams, true)
 		if err != nil || sc != txscript.ScriptHashTy {
 			continue
 		}
@@ -936,7 +940,7 @@ func (cmd *auditContractCmd) runOfflineCommand() error {
 		return errors.New("transaction does not contain the contract output")
 	}
 
-	pushes, err := txscript.ExtractAtomicSwapDataPushes(txscript.DefaultScriptVersion, cmd.contract)
+	pushes, err := txscript.ExtractAtomicSwapDataPushes(scriptVersion, cmd.contract)
 	if err != nil {
 		return err
 	}
